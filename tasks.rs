@@ -1,72 +1,150 @@
-use axum::{routing::get, Router, Server, extract::State, middleware};
-use leptos::*;
-use leptos_axum::{generate_route_list, LeptosRoutes};
-use dotenvy::dotenv;
-use sqlx::SqlitePool;
-use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use std::sync::Arc;
+use axum::{
+    extract::{Path, State, Json},
+    http::StatusCode,
+    response::{IntoResponse, Json as AxumJson},
+    routing::{get, post, put, delete},
+    Router,
+};
+use serde_json::json;
+use sqlx::{Pool, Sqlite};
+use crate::{
+    models::{Task, CreateTask, UpdateTask},
+    api::auth::get_user_id,
+};
 
-mod app;
-mod api;
-mod db;
-mod models;
-mod utils;
+// Handler to create a new task.
+async fn create_task(
+    State(pool): State<Pool<Sqlite>>,
+    user_id: Result<i64, crate::api::auth::AuthError>,
+    Json(payload): Json<CreateTask>,
+) -> Result<impl IntoResponse, crate::api::auth::AuthError> {
+    let user_id = user_id?; // Ensure the user is authenticated
 
-async fn leptos_routes_handler(State(options): State<LeptosOptions>, req: Request) -> Response {
-    let handler = leptos_axum::render_app_to_stream(options.to_owned(), move || view! { <app::App/> });
-    handler(req).await
+    let result = sqlx::query!(
+        "INSERT INTO tasks (user_id, title, description) VALUES (?, ?, ?)",
+        user_id,
+        payload.title,
+        payload.description
+    )
+    .execute(&pool)
+    .await?;
+
+    let task_id = result.last_insert_rowid();
+
+    let task = sqlx::query_as!(
+        Task,
+        "SELECT id, user_id, title, description, completed, created_at, updated_at FROM tasks WHERE id = ?",
+        task_id
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    Ok((StatusCode::CREATED, AxumJson(task)))
 }
 
-#[tokio::main]
-async fn main() {
-    dotenv().ok();
+// Handler to get all tasks for the authenticated user.
+async fn list_tasks(
+    State(pool): State<Pool<Sqlite>>,
+    user_id: Result<i64, crate::api::auth::AuthError>,
+) -> Result<impl IntoResponse, crate::api::auth::AuthError> {
+    let user_id = user_id?; // Ensure the user is authenticated
 
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    let tasks = sqlx::query_as!(
+        Task,
+        "SELECT id, user_id, title, description, completed, created_at, updated_at FROM tasks WHERE user_id = ?",
+        user_id
+    )
+    .fetch_all(&pool)
+    .await?;
 
-    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env");
-    let pool = SqlitePool::connect(&db_url)
-        .await
-        .expect("Failed to connect to the database");
-
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("Failed to run database migrations");
-
-    let conf = get_configuration(None).await.unwrap();
-    let leptos_options = conf.leptos_options;
-    let addr = leptos_options.site_addr;
-    let routes = generate_route_list(app::App);
-
-    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set in .env");
-    let jwt_secret_arc = Arc::new(jwt_secret);
-
-    let api_routes = Router::new()
-        .nest("/auth", api::auth::auth_router(jwt_secret_arc.clone()))
-        .nest("/tasks", api::tasks::tasks_router()) // Mount the tasks routes
-        .with_state(pool.clone())
-        .with_state(jwt_secret_arc.clone());
-
-    let router = Router::new()
-        .nest_service("/api", api_routes)
-        .leptos_routes(&leptos_options, routes, || view! { <app::App/> })
-        .with_state(leptos_options)
-        .with_state(pool.clone());
-
-    info!("listening on http://{}", &addr);
-    Server::bind(&addr)
-        .serve(router.into_make_service())
-        .await
-        .unwrap();
+    Ok(AxumJson(tasks))
 }
 
-#[component]
-fn App() -> impl IntoView {
-    view! {
-        <h1>"Task Management App (Backend)"</h1>
+// Handler to get a specific task by ID.
+async fn get_task(
+    State(pool): State<Pool<Sqlite>>,
+    user_id: Result<i64, crate::api::auth::AuthError>,
+    Path(task_id): Path<i64>,
+) -> Result<impl IntoResponse, crate::api::auth::AuthError> {
+    let user_id = user_id?; // Ensure the user is authenticated
+
+    let task = sqlx::query_as!(
+        Task,
+        "SELECT id, user_id, title, description, completed, created_at, updated_at FROM tasks WHERE id = ? AND user_id = ?",
+        task_id,
+        user_id
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    Ok(AxumJson(task))
+}
+
+// Handler to update a task.
+async fn update_task(
+    State(pool): State<Pool<Sqlite>>,
+    user_id: Result<i64, crate::api::auth::AuthError>,
+    Path(task_id): Path<i64>,
+    Json(payload): Json<UpdateTask>,
+) -> Result<impl IntoResponse, crate::api::auth::AuthError> {
+    let user_id = user_id?; // Ensure the user is authenticated
+
+    let mut tx = pool.begin().await?;
+
+    let result = sqlx::query!(
+        "UPDATE tasks SET title = COALESCE(?, title), description = COALESCE(?, description), completed = COALESCE(?, completed), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+        payload.title,
+        payload.description,
+        payload.completed,
+        task_id,
+        user_id
+    )
+    .execute(&mut tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(crate::api::auth::AuthError::Unauthorized); // Task not found or not owned by user
     }
+
+    tx.commit().await?;
+
+    let updated_task = sqlx::query_as!(
+        Task,
+        "SELECT id, user_id, title, description, completed, created_at, updated_at FROM tasks WHERE id = ?",
+        task_id
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    Ok(AxumJson(updated_task))
+}
+
+// Handler to delete a task.
+async fn delete_task(
+    State(pool): State<Pool<Sqlite>>,
+    user_id: Result<i64, crate::api::auth::AuthError>,
+    Path(task_id): Path<i64>,
+) -> Result<impl IntoResponse, crate::api::auth::AuthError> {
+    let user_id = user_id?; // Ensure the user is authenticated
+
+    let result = sqlx::query!(
+        "DELETE FROM tasks WHERE id = ? AND user_id = ?",
+        task_id,
+        user_id
+    )
+    .execute(&pool)
+    .await?;
+
+    if result.rows_affected() > 0 {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(crate::api::auth::AuthError::Unauthorized) // Task not found or not owned by user
+    }
+}
+
+pub fn tasks_router() -> Router {
+    Router::new()
+        .route("/", post(create_task).get(list_tasks))
+        .route("/:task_id", get(get_task).put(update_task).delete(delete_task))
+        .route_layer(axum::middleware::from_fn(crate::api::auth::auth_middleware)) // Apply auth middleware to all task routes
 }
